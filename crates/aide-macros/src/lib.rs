@@ -3,7 +3,9 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use proc_macro_error::proc_macro_error;
 use quote::{quote, ToTokens};
-use syn::{parse_macro_input, parse_quote, Attribute, DeriveInput, Expr, Generics, Ident, Lit, LitStr, Meta, Type};
+use syn::{parse_macro_input, parse_quote, Attribute, AttrStyle, DeriveInput, Expr, Generics, Ident, Item, ItemMod, Lit, LitStr, MacroDelimiter, Meta, MetaList, Path, PathArguments, PathSegment, Token, Type};
+use syn::punctuated::Punctuated;
+use syn::token::{Bracket, Paren};
 
 extern crate proc_macro;
 
@@ -200,7 +202,7 @@ struct ResponseField {
 }
 
 #[proc_macro_error]
-#[proc_macro_derive(IntoResponse, attributes(api, response))]
+#[proc_macro_derive(IntoResponse, attributes(transform, response))]
 pub fn into_response(input: TokenStream) -> TokenStream {
     let derive_input = syn::parse_macro_input!(input);
     let into_response = IntoResponseOpts::from_derive_input(&derive_input).unwrap();
@@ -209,8 +211,8 @@ pub fn into_response(input: TokenStream) -> TokenStream {
 }
 
 #[derive(FromDeriveInput)]
-#[darling(attributes(api))]
-struct ApiOpts {
+#[darling(attributes(transform))]
+struct TransformOpts {
     summary: Option<String>,
 }
 
@@ -219,9 +221,27 @@ struct ApiOpts {
 pub fn operation_output(input: TokenStream) -> TokenStream {
     let derive_input = syn::parse_macro_input!(input);
     let operation_output = IntoResponseOpts::from_derive_input(&derive_input).unwrap();
-    let api_opts = ApiOpts::from_derive_input(&derive_input).unwrap();
+    let transform_opts = TransformOpts::from_derive_input(&derive_input).unwrap();
 
-    OperationOutputBuilder(operation_output, api_opts).to_token_stream().into()
+    OperationOutputBuilder(operation_output, transform_opts).to_token_stream().into()
+}
+
+#[proc_macro_error]
+#[proc_macro_attribute]
+pub fn api(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = args.into();
+    let mut module = parse_macro_input!(input as ItemMod);
+    let Some((_, items)) = &mut module.content else {
+        return module.to_token_stream().into();
+    };
+    for i in 0..items.len() {
+        match &mut items[i] {
+            Item::Struct(s) => add_transform(&mut s.attrs, &args),
+            Item::Enum(e) => add_transform(&mut e.attrs, &args),
+            _ => {}
+        }
+    }
+    module.to_token_stream().into()
 }
 
 impl ToTokens for IntoResponseOpts {
@@ -323,11 +343,11 @@ impl<'a> IntoResponseArmBuilder<'a> {
     }
 }
 
-struct OperationOutputBuilder(IntoResponseOpts, ApiOpts);
+struct OperationOutputBuilder(IntoResponseOpts, TransformOpts);
 
 impl ToTokens for OperationOutputBuilder {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
-        let OperationOutputBuilder(response_opts, ApiOpts { summary }) = self;
+        let OperationOutputBuilder(response_opts, TransformOpts { summary }) = self;
         let summary = summary.as_ref().map(|summ| quote!(operation.summary = Some(#summ.into());));
         let inferred_responses = match &response_opts.data {
             darling::ast::Data::Struct(fields) => vec![
@@ -417,6 +437,35 @@ impl<'a> InferredResponsesBuilder<'a> {
             )]),
             ..Default::default()
         }))
+    }
+}
+
+fn add_transform(attrs: &mut Vec<Attribute>, transform_args: &proc_macro2::TokenStream) {
+    if attrs.iter().find(|attr| attr.meta.path().is_ident("derive") && attr
+        .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+        .unwrap()
+        .iter()
+        .find(|nested_meta| nested_meta.path().is_ident("OperationOutput"))
+        .is_some()
+    ).is_some() {
+        attrs.push(Attribute {
+            pound_token: Token![#](Span::call_site()),
+            style: AttrStyle::Outer,
+            bracket_token: Bracket(Span::call_site()),
+            meta: Meta::List(MetaList {
+                path: Path {
+                    leading_colon: None,
+                    segments: Punctuated::from_iter([
+                        PathSegment {
+                            ident: Ident::new("transform", Span::call_site()),
+                            arguments: PathArguments::None,
+                        }
+                    ].into_iter()),
+                },
+                tokens: transform_args.clone(),
+                delimiter: MacroDelimiter::Paren(Paren(Span::call_site())),
+            })
+        });
     }
 }
 
