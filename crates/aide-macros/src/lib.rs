@@ -1,7 +1,9 @@
-use darling::FromDeriveInput;
+use darling::{FromDeriveInput, FromField, FromVariant};
 use proc_macro::TokenStream;
-use quote::quote;
-use syn::{parse_macro_input, parse_quote, DeriveInput, Type};
+use proc_macro2::Span;
+use proc_macro_error::proc_macro_error;
+use quote::{quote, ToTokens};
+use syn::{parse_macro_input, parse_quote, Attribute, DeriveInput, Expr, Generics, Ident, Lit, LitStr, Meta, Type};
 
 extern crate proc_macro;
 
@@ -165,4 +167,321 @@ pub fn derive_operation_io(ts: TokenStream) -> TokenStream {
     }
 
     ts.into()
+}
+
+#[derive(FromDeriveInput)]
+#[darling(attributes(response), forward_attrs(doc))]
+struct IntoResponseOpts {
+    ident: Ident,
+    generics: Generics,
+    data: darling::ast::Data<IntoResponseVariant, ResponseField>,
+    attrs: Vec<Attribute>,
+    status: Option<String>,
+    body: Option<Type>,
+    content_type: Option<LitStr>,
+}
+
+#[derive(FromVariant)]
+#[darling(attributes(response), forward_attrs(doc))]
+struct IntoResponseVariant {
+    ident: Ident,
+    fields: darling::ast::Fields<ResponseField>,
+    attrs: Vec<Attribute>,
+    status: String,
+    body: Option<Type>,
+    content_type: Option<LitStr>,
+}
+
+#[derive(FromField)]
+#[darling(attributes())]
+struct ResponseField {
+    ident: Option<Ident>,
+    ty: Type,
+}
+
+#[proc_macro_error]
+#[proc_macro_derive(IntoResponse, attributes(api, response))]
+pub fn into_response(input: TokenStream) -> TokenStream {
+    let derive_input = syn::parse_macro_input!(input);
+    let into_response = IntoResponseOpts::from_derive_input(&derive_input).unwrap();
+
+    into_response.to_token_stream().into()
+}
+
+#[derive(FromDeriveInput)]
+#[darling(attributes(api))]
+struct ApiOpts {
+    summary: Option<String>,
+}
+
+#[proc_macro_error]
+#[proc_macro_derive(OperationOutput, attributes(response))]
+pub fn operation_output(input: TokenStream) -> TokenStream {
+    let derive_input = syn::parse_macro_input!(input);
+    let operation_output = IntoResponseOpts::from_derive_input(&derive_input).unwrap();
+    let api_opts = ApiOpts::from_derive_input(&derive_input).unwrap();
+
+    OperationOutputBuilder(operation_output, api_opts).to_token_stream().into()
+}
+
+impl ToTokens for IntoResponseOpts {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let responder_arms = match &self.data {
+            darling::ast::Data::Struct(fields) => vec![
+                IntoResponseArmBuilder {
+                    outer_ident: None,
+                    ident: &self.ident,
+                    fields: fields,
+                    attrs: &self.attrs,
+                    status: self.status.as_deref().unwrap_or("OK"),
+                    body: self.body.as_ref(),
+                    content_type: self.content_type.as_ref(),
+                }.build()
+            ],
+            darling::ast::Data::Enum(enum_value) => enum_value
+                .iter()
+                .map(|variant| IntoResponseArmBuilder {
+                    outer_ident: Some(&self.ident),
+                    ident: &variant.ident,
+                    fields: &variant.fields,
+                    attrs: &variant.attrs,
+                    status: &variant.status,
+                    body: variant.body.as_ref().or(self.body.as_ref()),
+                    content_type: variant.content_type.as_ref(),
+                }.build())
+                .collect::<Vec<proc_macro2::TokenStream>>(),
+        };
+
+        let ident = &self.ident;
+        let (impl_generics, ty_generics, where_clause) = self.generics.split_for_impl();
+
+        tokens.extend(quote!{
+            impl #impl_generics axum::response::IntoResponse for #ident #ty_generics #where_clause {
+                fn into_response(self) -> axum::response::Response {
+                    match self {
+                        #(#responder_arms),*
+                    }
+                }
+            }
+        })
+    }
+}
+
+struct IntoResponseArmBuilder<'a> {
+    outer_ident: Option<&'a Ident>,
+    ident: &'a Ident,
+    fields: &'a darling::ast::Fields<ResponseField>,
+    attrs: &'a[Attribute],
+    status: &'a str,
+    body: Option<&'a Type>,
+    content_type: Option<&'a LitStr>,
+}
+
+impl<'a> IntoResponseArmBuilder<'a> {
+    fn build(self) -> proc_macro2::TokenStream {
+        let outer_ident = self.outer_ident.map(|ident| quote!(#ident::));
+        let ident = self.ident;
+        let status = Ident::new(&self.status, Span::call_site());
+        let ty = self.body;
+        let description = self.attrs.iter().filter_map(|attr| {
+            attr.path().get_ident().filter(|&ident| ident == "doc")?;
+            let Meta::NameValue(name_value) = &attr.meta else { return None };
+            let Expr::Lit(doc_comment) = &name_value.value else { return None };
+            let Lit::Str(comment) = &doc_comment.lit else { return None };
+            Some(comment.value().trim().to_string())
+        }).collect::<Vec<String>>().join("\n");
+        let default_content_type = LitStr::new("application/json", Span::call_site());
+        let content_type = self.content_type.unwrap_or(&default_content_type);
+        let response_attr = quote!(aide::axum::ResponseAttributes{
+            status_code: axum::http::StatusCode::#status,
+            content_type: #content_type,
+            description: #description,
+        });
+        match self.fields.style {
+            darling::ast::Style::Struct => {
+                let idents = self.fields.fields.iter().map(|field| &field.ident).collect::<Vec<_>>();
+                quote!(
+                    #outer_ident #ident { #(#idents),* } => #ty::from((#(#idents),*))
+                        .attr_into_response(#response_attr)
+                )
+            },
+            darling::ast::Style::Tuple => {
+                let idents = self.fields.fields.iter().enumerate().map(|(i, _)| {
+                    let mut ident = i.to_string();
+                    ident.insert(0, 'i');
+                    return Ident::new(&ident, Span::call_site());
+                }).collect::<Vec<_>>();
+                quote!(
+                    #outer_ident #ident(#(#idents),*) => #ty::from((#(#idents),*))
+                        .attr_into_response(#response_attr)
+                )
+            },
+            darling::ast::Style::Unit => quote!(
+                #outer_ident #ident => #ty::from(()).attr_into_response(#response_attr)
+            ),
+        }
+    }
+}
+
+struct OperationOutputBuilder(IntoResponseOpts, ApiOpts);
+
+impl ToTokens for OperationOutputBuilder {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let OperationOutputBuilder(response_opts, ApiOpts { summary }) = self;
+        let summary = summary.as_ref().map(|summ| quote!(operation.summary = Some(#summ.into());));
+        let inferred_responses = match &response_opts.data {
+            darling::ast::Data::Struct(fields) => vec![
+                InferredResponsesBuilder {
+                    fields: fields,
+                    attrs: &response_opts.attrs,
+                    status: response_opts.status.as_deref().unwrap_or("OK"),
+                    body: response_opts.body.as_ref(),
+                    content_type: response_opts.content_type.as_ref(),
+                }.build()
+            ],
+            darling::ast::Data::Enum(enum_value) => enum_value
+                .iter()
+                .map(|variant| InferredResponsesBuilder {
+                    fields: &variant.fields,
+                    attrs: &variant.attrs,
+                    status: &variant.status,
+                    body: variant.body.as_ref().or(response_opts.body.as_ref()),
+                    content_type: variant.content_type.as_ref(),
+                }.build())
+                .collect::<Vec<proc_macro2::TokenStream>>(),
+        };
+
+        let ident = &response_opts.ident;
+        let (impl_generics, ty_generics, where_clause) = response_opts.generics.split_for_impl();
+
+        tokens.extend(quote!{
+            impl #impl_generics aide::operation::OperationOutput for #ident #ty_generics #where_clause {
+                type Inner = Self;
+
+                fn inferred_responses(
+                    ctx: &mut aide::gen::GenContext,
+                    operation: &mut aide::openapi::Operation,
+                ) -> Vec<(Option<u16>, aide::openapi::Response)> {
+                    #summary
+                    [#(#inferred_responses),*].into()
+                }
+            }
+        })
+    }
+}
+
+struct InferredResponsesBuilder<'a> {
+    fields: &'a darling::ast::Fields<ResponseField>,
+    attrs: &'a[Attribute],
+    status: &'a str,
+    body: Option<&'a Type>,
+    content_type: Option<&'a LitStr>,
+}
+
+impl<'a> InferredResponsesBuilder<'a> {
+    fn build(self) -> proc_macro2::TokenStream {
+        let ty = self.body;
+        match self.fields.style {
+            darling::ast::Style::Struct | darling::ast::Style::Tuple => {
+                let types = self.fields.fields.iter().map(|field| &field.ty);
+                self.build_from_type(quote!(#ty<#(#types),*>))
+            },
+            darling::ast::Style::Unit => self.build_from_type(quote!(#ty)),
+        }
+    }
+
+    fn build_from_type(&self, ty: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+        let status = status_code(self.status);
+        let description = self.attrs.iter().filter_map(|attr| {
+            attr.path().get_ident().filter(|&ident| ident == "doc")?;
+            let Meta::NameValue(name_value) = &attr.meta else { return None };
+            let Expr::Lit(doc_comment) = &name_value.value else { return None };
+            let Lit::Str(comment) = &doc_comment.lit else { return None };
+            Some(comment.value().trim().to_string())
+        }).collect::<Vec<String>>().join("\n");
+        let default_content_type = LitStr::new("application/json", Span::call_site());
+        let content_type = self.content_type.unwrap_or(&default_content_type);
+
+        quote!((Some(#status), aide::openapi::Response {
+            description: #description.into(),
+            content: aide::indexmap::IndexMap::from_iter([(
+                #content_type.into(),
+                aide::openapi::MediaType {
+                    schema: Some(aide::openapi::SchemaObject {
+                        json_schema: ctx.schema.subschema_for::<#ty>().into_object().into(),
+                        example: None,
+                        external_docs: None,
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }))
+    }
+}
+
+fn status_code(status_name: &str) -> u16 {
+    match status_name {
+        "CONTINUE" => 100,
+        "SWITCHING_PROTOCOLS" => 101,
+        "PROCESSING" => 102,
+        "OK" => 200,
+        "CREATED" => 201,
+        "ACCEPTED" => 202,
+        "NON_AUTHORITATIVE_INFORMATION" => 203,
+        "NO_CONTENT" => 204,
+        "RESET_CONTENT" => 205,
+        "PARTIAL_CONTENT" => 206,
+        "MULTI_STATUS" => 207,
+        "ALREADY_REPORTED" => 208,
+        "IM_USED" => 226,
+        "MULTIPLE_CHOICES" => 300,
+        "MOVED_PERMANENTLY" => 301,
+        "FOUND" => 302,
+        "SEE_OTHER" => 303,
+        "NOT_MODIFIED" => 304,
+        "USE_PROXY" => 305,
+        "TEMPORARY_REDIRECT" => 307,
+        "PERMANENT_REDIRECT" => 308,
+        "BAD_REQUEST" => 400,
+        "UNAUTHORIZED" => 401,
+        "PAYMENT_REQUIRED" => 402,
+        "FORBIDDEN" => 403,
+        "NOT_FOUND" => 404,
+        "METHOD_NOT_ALLOWED" => 405,
+        "NOT_ACCEPTABLE" => 406,
+        "PROXY_AUTHENTICATION_REQUIRED" => 407,
+        "REQUEST_TIMEOUT" => 408,
+        "CONFLICT" => 409,
+        "GONE" => 410,
+        "LENGTH_REQUIRED" => 411,
+        "PRECONDITION_FAILED" => 412,
+        "PAYLOAD_TOO_LARGE" => 413,
+        "URI_TOO_LONG" => 414,
+        "UNSUPPORTED_MEDIA_TYPE" => 415,
+        "RANGE_NOT_SATISFIABLE" => 416,
+        "EXPECTATION_FAILED" => 417,
+        "IM_A_TEAPOT" => 418,
+        "MISDIRECTED_REQUEST" => 421,
+        "UNPROCESSABLE_ENTITY" => 422,
+        "LOCKED" => 423,
+        "FAILED_DEPENDENCY" => 424,
+        "UPGRADE_REQUIRED" => 426,
+        "PRECONDITION_REQUIRED" => 428,
+        "TOO_MANY_REQUESTS" => 429,
+        "REQUEST_HEADER_FIELDS_TOO_LARGE" => 431,
+        "UNAVAILABLE_FOR_LEGAL_REASONS" => 451,
+        "INTERNAL_SERVER_ERROR" => 500,
+        "NOT_IMPLEMENTED" => 501,
+        "BAD_GATEWAY" => 502,
+        "SERVICE_UNAVAILABLE" => 503,
+        "GATEWAY_TIMEOUT" => 504,
+        "HTTP_VERSION_NOT_SUPPORTED" => 505,
+        "VARIANT_ALSO_NEGOTIATES" => 506,
+        "INSUFFICIENT_STORAGE" => 507,
+        "LOOP_DETECTED" => 508,
+        "NOT_EXTENDED" => 510,
+        "NETWORK_AUTHENTICATION_REQUIRED" => 511,
+        _ => 0,
+    }
 }

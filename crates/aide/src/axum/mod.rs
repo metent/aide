@@ -180,8 +180,8 @@ use crate::{
 use axum::{
     body::Body,
     handler::Handler,
-    http::Request,
-    response::IntoResponse,
+    http::{Request, StatusCode},
+    response::{IntoResponse, Response},
     routing::{IntoMakeService, Route, RouterAsService, RouterIntoService},
     Router,
 };
@@ -741,6 +741,16 @@ where
     I: OperationInput,
     O: OperationOutput,
 {
+}
+
+pub struct ResponseAttributes {
+    pub status_code: StatusCode,
+    pub content_type: &'static str,
+    pub description: &'static str,
+}
+
+pub trait AttrIntoResponse {
+    fn attr_into_response(self, attr: ResponseAttributes) -> Response;
 }
 
 #[cfg(test)]
