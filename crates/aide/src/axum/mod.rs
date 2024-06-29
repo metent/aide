@@ -185,10 +185,12 @@ use axum::{
     routing::{IntoMakeService, Route, RouterAsService, RouterIntoService},
     Router,
 };
+use axum::extract::Json;
 #[cfg(not(feature = "axum-wasm"))]
 use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
 use indexmap::map::Entry;
 use indexmap::IndexMap;
+use serde::Serialize;
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -751,6 +753,12 @@ pub struct ResponseAttributes {
 
 pub trait AttrIntoResponse {
     fn attr_into_response(self, attr: ResponseAttributes) -> Response;
+}
+
+impl<T: Serialize + IntoResponse> AttrIntoResponse for T {
+	fn attr_into_response(self, _: ResponseAttributes) -> Response {
+		Json(self).into_response()
+	}
 }
 
 #[cfg(test)]
