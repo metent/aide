@@ -301,22 +301,13 @@ impl<'a> IntoResponseArmBuilder<'a> {
     fn build(self) -> proc_macro2::TokenStream {
         let outer_ident = self.outer_ident.map(|ident| quote!(#ident::));
         let ident = self.ident;
-        let status = Ident::new(&self.status, Span::call_site());
         let ty = self.body;
-        let description = self.attrs.iter().filter_map(|attr| {
-            attr.path().get_ident().filter(|&ident| ident == "doc")?;
-            let Meta::NameValue(name_value) = &attr.meta else { return None };
-            let Expr::Lit(doc_comment) = &name_value.value else { return None };
-            let Lit::Str(comment) = &doc_comment.lit else { return None };
-            Some(comment.value().trim().to_string())
-        }).collect::<Vec<String>>().join("\n");
-        let default_content_type = LitStr::new("application/json", Span::call_site());
-        let content_type = self.content_type.unwrap_or(&default_content_type);
-        let response_attr = quote!(aide::axum::ResponseAttributes{
-            status_code: axum::http::StatusCode::#status,
-            content_type: #content_type,
-            description: #description,
-        });
+        let response_attr = self.get_response_attr();
+
+        if ty.is_none() {
+            return quote!(#outer_ident #ident { .. } => self.attr_into_response(#response_attr));
+        }
+
         match self.fields.style {
             darling::ast::Style::Struct => {
                 let idents = self.fields.fields.iter().map(|field| &field.ident).collect::<Vec<_>>();
@@ -341,6 +332,25 @@ impl<'a> IntoResponseArmBuilder<'a> {
             ),
         }
     }
+
+    fn get_response_attr(&self) -> proc_macro2::TokenStream {
+        let status = Ident::new(&self.status, Span::call_site());
+        let description = self.attrs.iter().filter_map(|attr| {
+            attr.path().get_ident().filter(|&ident| ident == "doc")?;
+            let Meta::NameValue(name_value) = &attr.meta else { return None };
+            let Expr::Lit(doc_comment) = &name_value.value else { return None };
+            let Lit::Str(comment) = &doc_comment.lit else { return None };
+            Some(comment.value().trim().to_string())
+        }).collect::<Vec<String>>().join("\n");
+        let default_content_type = LitStr::new("application/json", Span::call_site());
+        let content_type = self.content_type.unwrap_or(&default_content_type);
+
+        return quote!(aide::axum::ResponseAttributes{
+            status_code: axum::http::StatusCode::#status,
+            content_type: #content_type,
+            description: #description,
+        });
+    }
 }
 
 struct OperationOutputBuilder(IntoResponseOpts, TransformOpts);
@@ -352,6 +362,7 @@ impl ToTokens for OperationOutputBuilder {
         let inferred_responses = match &response_opts.data {
             darling::ast::Data::Struct(fields) => vec![
                 InferredResponsesBuilder {
+                    ident: &response_opts.ident,
                     fields: fields,
                     attrs: &response_opts.attrs,
                     status: response_opts.status.as_deref().unwrap_or("OK"),
@@ -362,6 +373,7 @@ impl ToTokens for OperationOutputBuilder {
             darling::ast::Data::Enum(enum_value) => enum_value
                 .iter()
                 .map(|variant| InferredResponsesBuilder {
+                    ident: &response_opts.ident,
                     fields: &variant.fields,
                     attrs: &variant.attrs,
                     status: &variant.status,
@@ -391,6 +403,7 @@ impl ToTokens for OperationOutputBuilder {
 }
 
 struct InferredResponsesBuilder<'a> {
+    ident: &'a Ident,
     fields: &'a darling::ast::Fields<ResponseField>,
     attrs: &'a[Attribute],
     status: &'a str,
@@ -400,6 +413,11 @@ struct InferredResponsesBuilder<'a> {
 
 impl<'a> InferredResponsesBuilder<'a> {
     fn build(self) -> proc_macro2::TokenStream {
+        if self.body.is_none() {
+            let ident = self.ident;
+            return self.build_from_type(quote!(#ident));
+        }
+
         let ty = self.body;
         match self.fields.style {
             darling::ast::Style::Struct | darling::ast::Style::Tuple => {
