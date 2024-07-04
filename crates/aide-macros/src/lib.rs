@@ -328,7 +328,7 @@ impl<'a> IntoResponseArmBuilder<'a> {
                 )
             },
             darling::ast::Style::Unit => quote!(
-                #outer_ident #ident => #ty::from(()).attr_into_response(#response_attr)
+                #outer_ident #ident => #ty::default().attr_into_response(#response_attr)
             ),
         }
     }
